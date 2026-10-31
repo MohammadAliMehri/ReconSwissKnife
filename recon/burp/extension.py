@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Recon Swiss Knife Pro 3.1.0 - Semi-Active Security Recon & Method Fuzzer
+Recon Swiss Knife Pro 3.2.1 - Semi-Active Security Recon & Method Fuzzer
 ================================================================================
 Production-grade Burp Suite extension (Jython 2.7) for passive + semi-active
 reconnaissance.  Extracts endpoints, parameters, JS files, risky HTTP methods,
@@ -13,8 +13,8 @@ Semi-active modules:
   * Active cross-method fuzzing (PUT, DELETE, PATCH, DEBUG, TRACE).
 
 UI features:
-  * Professional dark-mode / light-mode auto-detected corporate dashboard.
-  * No bottom split-pane - tables occupy full space.
+  * Burp-themed explicit category navigation, regex evidence and a PII view.
+  * Scoped selected-GET scans and two-session access comparisons.
   * Interactive JDialog popups with native Burp message editors on double-click.
   * Leak value auto-highlighting via ITextEditor search expression.
   * JS response beautifier for minified scripts.
@@ -29,6 +29,7 @@ Requires: Jython standalone JAR configured in Extender -> Options.
 # ---------------------------------------------------------------------------
 
 from burp import IBurpExtender
+from burp import IBurpExtenderCallbacks
 from burp import IHttpListener
 from burp import ITab
 from burp import IContextMenuFactory
@@ -39,11 +40,11 @@ from javax.swing import (JPanel, JButton, JLabel, JTabbedPane, JTable,
                           JScrollPane, BoxLayout, JTextField, SwingUtilities,
                           BorderFactory, JOptionPane, RowFilter, JMenuItem,
                           JPopupMenu, JCheckBox, UIManager, JDialog, JSplitPane,
-                          JTextArea, JPasswordField, ListSelectionModel)
+                          JTextArea, ListSelectionModel, JList, DefaultListModel)
 from javax.swing.table import DefaultTableModel, TableRowSorter
 from javax.swing.event import DocumentListener, ListSelectionListener, ChangeListener
 from java.awt import (BorderLayout, FlowLayout, GridLayout, Color, Font,
-                       Toolkit, Dimension, Cursor)
+                       Toolkit, Dimension, Cursor, CardLayout)
 from java.awt.datatransfer import StringSelection
 from java.awt.event import ActionListener, MouseAdapter
 from java.util import ArrayList
@@ -53,21 +54,19 @@ from java.lang import Runnable, Thread
 
 import re
 import threading
-import json
 import time
-from urlparse import urlsplit, urljoin, urlunsplit
-from recon.core.evidence import cookie_attributes, method_result_label, is_valid_iranian_national_id
-from recon.core.redaction import redact_ai_text
-from recon.core.urls import ai_endpoint
-from recon.ai.protocol import AI_SYSTEM_PROMPT, validate_ai_findings
-from recon.ai.context import format_ai_context
+import uuid
+from urlparse import urlsplit, urljoin
+from recon.core.evidence import cookie_attributes, method_result_label, is_valid_iranian_national_id, valid_luhn, valid_iranian_iban
+from recon.core.iranian import scan_iranian, decode_web_text, PII_LABELS
+from recon.core.extraction import extract_parameters, new_error_signatures, reflected_marker, parameter_focus, reflection_evidence
 
 
 # ---------------------------------------------------------------------------
 # Constants / Regex patterns  (compiled once at module load)
 # ---------------------------------------------------------------------------
 
-VERSION = "3.1.0"
+VERSION = "3.2.1"
 EXTENSION_NAME = "Recon Swiss Knife Pro " + VERSION
 
 BINARY_EXTENSIONS = (
@@ -89,17 +88,10 @@ SENSITIVE_METHODS = set(['PUT', 'DELETE', 'TRACE', 'PATCH', 'OPTIONS',
 
 FUZZ_METHODS = ['PUT', 'DELETE', 'PATCH', 'DEBUG', 'TRACE']
 
-SECURITY_HEADERS = [
-    'X-Frame-Options',
-    'Content-Security-Policy',
-    'Strict-Transport-Security',
-    'X-Content-Type-Options',
-    'X-XSS-Protection'
-]
 
 # --- Leak detection ---
-RE_IRAN_NATIONAL_ID   = re.compile(r'\b\d{10}\b')
-RE_IRAN_MOBILE        = re.compile(r'(?:\+98|0098|0)?9\d{9}\b')
+RE_PAYMENT_CARD = re.compile(r'(?<![A-Za-z0-9])(?:[0-9][ -]?){12,18}[0-9](?![A-Za-z0-9])')
+RE_INTL_PHONE = re.compile(r'(?<![A-Za-z0-9])\+[1-9][0-9](?:[ -]?[0-9]){7,13}\b')
 RE_EMAIL              = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
 RE_AWS_KEY            = re.compile(r'\b(AKIA|ASIA)[0-9A-Z]{16}\b')
 RE_AWS_SECRET         = re.compile(r'(?i)aws(.{0,20})?(secret|key)[\'"\s:=]{1,4}[A-Za-z0-9/+=]{40}')
@@ -113,8 +105,6 @@ RE_FIREBASE_URL       = re.compile(r'(?i)https?://[a-z0-9\-]+\.firebaseio\.com')
 
 # --- Endpoint / param extraction ---
 RE_JS_FILE     = re.compile(r'(?i)\.js(\?[^"\'\<\>\s]*)?$')
-RE_QUERY_PARAM = re.compile(r'[?&]([A-Za-z0-9_\-\.\[\]]+)=([^&\s#]*)')
-RE_POST_PARAM  = re.compile(r'([A-Za-z0-9_\-\.\[\]]+)=([^&\s]*)')
 
 # --- JS deep-scan patterns ---
 RE_JS_ABSOLUTE_ENDPOINT = re.compile(
@@ -138,7 +128,7 @@ RE_JS_SRC_ATTR = re.compile(
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Evidence labels and AI protocol (compatible with Jython 2.7)
+# Evidence labels and regex helpers (compatible with Jython 2.7)
 # ---------------------------------------------------------------------------
 
 
@@ -153,16 +143,6 @@ RE_JS_SRC_ATTR = re.compile(
 
 
 
-def build_ai_context(msg, helpers):
-    """Extract a Burp response; delegate redaction and formatting to the pure core."""
-    raw = msg.getResponse()
-    if raw is None:
-        raise ValueError('The selected message has no response.')
-    info = helpers.analyzeRequest(msg)
-    response = helpers.analyzeResponse(raw)
-    body = helpers.bytesToString(raw)[response.getBodyOffset():][:200000]
-    return format_ai_context(str(info.getMethod()), str(info.getUrl()),
-                             response.getStatusCode(), response.getHeaders(), body)
 
 
 class _UiCall(Runnable):
@@ -185,12 +165,6 @@ def copy_to_clipboard(text):
         pass
 
 
-def _looks_like_plain_text(text):
-    """Heuristic: return True if text has no regex metacharacters."""
-    try:
-        return not re.search(r'[\.\*\+\?\(\)\[\]\{\}\|\^\$\\]', text)
-    except Exception:
-        return True
 
 
 def beautify_js(js_code):
@@ -413,6 +387,10 @@ class DataStore(object):
 
     def __init__(self):
         self.lock = threading.Lock()
+        self.generation = 0
+        self.parameters = []
+        self.seen_parameter_keys = set()
+        self.active_results = []
         # url -> {"method":str, "params":set, "msg":IHttpRequestResponse}
         self.endpoints = {}
         # url -> IHttpRequestResponse
@@ -442,6 +420,10 @@ class DataStore(object):
 
     def clear(self):
         with self.lock:
+            self.generation += 1
+            del self.parameters[:]
+            self.seen_parameter_keys.clear()
+            del self.active_results[:]
             self.endpoints.clear()
             self.js_files.clear()
             del self.methods_findings[:]
@@ -458,6 +440,26 @@ class DataStore(object):
             self.probed_urls.clear()
             self.fetched_js_urls.clear()
             del self.fuzz_results[:]
+
+    def add_parameters(self, url, records, msg):
+        with self.lock:
+            for record in records:
+                key = (url, record['name'], record['location'])
+                if key in self.seen_parameter_keys or len(self.parameters) >= 10000:
+                    continue
+                self.seen_parameter_keys.add(key)
+                row = dict(record)
+                row.update(url=url, msg=msg)
+                self.parameters.append(row)
+
+    def add_active_result(self, url, parameter, test, status, evidence, msg, generation):
+        with self.lock:
+            if generation != self.generation:
+                return
+            self.active_results.append(dict(url=url, parameter=parameter, test=test,
+                                            status=status, evidence=evidence, msg=msg))
+            if len(self.active_results) > 2000:
+                del self.active_results[0]
 
     def add_endpoint(self, url, method, params, msg):
         with self.lock:
@@ -564,6 +566,34 @@ class DataStore(object):
 # Core analyzer - all parsing logic isolated & defensive
 # ---------------------------------------------------------------------------
 
+def decode_response_body(raw, helpers, info):
+    """Bounded gzip/deflate decoding; unsupported encodings are never regex-scanned."""
+    encoding = ''
+    for header in info.getHeaders():
+        if header.lower().startswith('content-encoding:'):
+            encoding = header.split(':', 1)[1].strip().lower()
+    if encoding in ('', 'identity'):
+        return decode_web_text(helpers.bytesToString(raw)[info.getBodyOffset():][:800000], info.getHeaders())
+    if encoding not in ('gzip', 'deflate'):
+        return None
+    from java.io import ByteArrayInputStream, ByteArrayOutputStream
+    from java.util.zip import GZIPInputStream, InflaterInputStream
+    from jarray import zeros
+    stream = ByteArrayInputStream(raw[info.getBodyOffset():])
+    stream = GZIPInputStream(stream) if encoding == 'gzip' else InflaterInputStream(stream)
+    output = ByteArrayOutputStream()
+    buf = zeros(4096, 'b')
+    try:
+        while output.size() < 800000:
+            count = stream.read(buf, 0, min(4096, 800000 - output.size()))
+            if count < 0:
+                break
+            output.write(buf, 0, count)
+        return decode_web_text(unicode(output.toString('ISO-8859-1')), info.getHeaders())
+    finally:
+        stream.close()
+
+
 class ReconAnalyzer(object):
     def __init__(self, helpers, store, scope, on_js_discovered=None):
         self._helpers = helpers
@@ -614,35 +644,17 @@ class ReconAnalyzer(object):
             if RE_JS_FILE.search(path):
                 self._register_js(url_str, msg)
 
-            # --- Parameter extraction ---
-            params = set()
-            try:
-                for m in RE_QUERY_PARAM.finditer(url_str):
-                    params.add(m.group(1))
-            except Exception:
-                pass
-
+            request_body, request_type = '', ''
             if request_bytes is not None:
-                try:
-                    req_info = self._helpers.analyzeRequest(request_bytes)
-                    body_offset = req_info.getBodyOffset()
-                    req_str = self._helpers.bytesToString(request_bytes)
-                    body = req_str[body_offset:] if body_offset < len(req_str) else ""
-                    ctype = ""
-                    for h in req_info.getHeaders():
-                        if h.lower().startswith('content-type:'):
-                            ctype = h.lower()
-                            break
-                    if body and 'application/x-www-form-urlencoded' in ctype:
-                        for m in RE_POST_PARAM.finditer(body):
-                            params.add(m.group(1))
-                    elif body and 'application/json' in ctype:
-                        for m in re.finditer(r'"([A-Za-z0-9_\-\.]+)"\s*:', body):
-                            params.add(m.group(1))
-                except Exception:
-                    pass
-
-            self._store.add_endpoint(url_str, method, params, msg)
+                req_info = self._helpers.analyzeRequest(request_bytes)
+                raw_request = self._helpers.bytesToString(request_bytes)
+                request_body = decode_web_text(raw_request[req_info.getBodyOffset():][:800000], req_info.getHeaders())
+                for header in req_info.getHeaders():
+                    if header.lower().startswith('content-type:'):
+                        request_type = header.split(':', 1)[1]
+            records = extract_parameters(url_str, request_body, request_type)
+            self._store.add_parameters(url_str, records, msg)
+            self._store.add_endpoint(url_str, method, set(r['name'] for r in records if r['location'] in ('Query', 'Form body', 'JSON body', 'Multipart body')), msg)
 
             # --- Response analysis (skip binary) ---
             if response_bytes is None:
@@ -654,27 +666,31 @@ class ReconAnalyzer(object):
             except Exception:
                 return
 
+            self._check_cookies(url_str, headers_list, msg)
+            self._scan_leaks(url_str, '\n'.join(unicode(h) for h in headers_list), msg)
             if self.is_binary_response(headers_list, path):
                 return
-
             self._check_security_headers(url_str, headers_list, msg)
-            self._check_cookies(url_str, headers_list, msg)
-
-            try:
-                body_offset = resp_info.getBodyOffset()
-                resp_str = self._helpers.bytesToString(response_bytes)
-                body = resp_str[body_offset:] if body_offset < len(resp_str) else ""
-            except Exception:
-                body = ""
-
+            body = decode_response_body(response_bytes, self._helpers, resp_info)
+            if body is None:
+                self._store.add_header_finding(url_str, 'Body scan skipped: unsupported content encoding. Use an uncompressed response for regex extraction.', msg)
+                return
+            response_type = ''
+            for header in headers_list:
+                if header.lower().startswith('content-type:'):
+                    response_type = header.split(':', 1)[1]
+            self._store.add_parameters(url_str, extract_parameters(url_str, response_body=body,
+                                       response_type=response_type), msg)
             if body:
-                if len(body) > 800000:
-                    body = body[:800000]
                 self._scan_leaks(url_str, body, msg)
                 self._extract_js_from_body(url_str, body, msg)
+                if RE_JS_FILE.search(path) or 'javascript' in response_type.lower():
+                    JsDeepScanner(self._store).scan(url_str, body, msg)
 
-        except Exception:
-            pass
+        except Exception as error:
+            callbacks = getattr(self._scope, '_callbacks', None)
+            if callbacks is not None:
+                callbacks.printError('Response analysis failed: ' + type(error).__name__)
 
     def _register_js(self, js_url, msg):
         try:
@@ -751,10 +767,14 @@ class ReconAnalyzer(object):
 
     def _scan_leaks(self, url, body, msg):
         """Scan response body for secrets, tokens, PII, and cloud keys."""
+        iranian = scan_iranian(body)
+        specific_values = set(f['value'] for f in iranian if f['type'] in ('Iranian Mobile', 'Iranian bank card (known BIN, Luhn)'))
+        for finding in iranian:
+            self._store.add_leak(finding['type'], finding['value'], url, msg)
         scanners = [
+            (RE_PAYMENT_CARD, "Possible payment card (Luhn)", False, valid_luhn),
+            (RE_INTL_PHONE, "International Phone", False, None),
             (RE_EMAIL,            "Email",                    False, None),
-            (RE_IRAN_MOBILE,      "Iranian Mobile",           False, None),
-            (RE_IRAN_NATIONAL_ID, "Iranian National ID",      False, is_valid_iranian_national_id),
             (RE_JWT,              "JWT Token",                True,  None),
             (RE_AWS_KEY,          "AWS Access Key",           False, None),
             (RE_AWS_SECRET,       "AWS Secret Key (possible)", True,  None),
@@ -769,6 +789,8 @@ class ReconAnalyzer(object):
             try:
                 for m in pattern.finditer(body):
                     val = m.group(0)
+                    if pattern in (RE_PAYMENT_CARD, RE_INTL_PHONE) and val in specific_values:
+                        continue
                     if validator and not validator(val):
                         continue
                     display = val[:80] + "..." if truncate and len(val) > 80 else val
@@ -853,6 +875,9 @@ class ActiveEngine(object):
             ArrayBlockingQueue(64))
         self._request_lock = threading.Lock()
         self._last_request = 0.0
+        self._last_status = 'Active requests require Burp Target scope. Select a GET request to scan.'
+        self._scan_urls = set()
+        self._closed = False
         self._enabled = {"js_fetch": False, "method_probe": False}
         self._lock = threading.Lock()
         self._on_result_callback = None
@@ -866,6 +891,7 @@ class ActiveEngine(object):
     def _submit_task(self, task, claim=None, url=None):
         try:
             self._executor.submit(task)
+            return True
         except Exception as e:
             with self._store.lock:
                 if claim == "js":
@@ -873,6 +899,240 @@ class ActiveEngine(object):
                 elif claim == "probe":
                     self._store.probed_urls.discard(url)
             self._report_error("Queue submission", e)
+            return False
+
+    def _access_pair(self, first, second):
+        a = self._helpers.analyzeRequest(first)
+        b = self._helpers.analyzeRequest(second)
+        url = str(a.getUrl())
+        if url != str(b.getUrl()) or str(a.getMethod()) != 'GET' or str(b.getMethod()) != 'GET':
+            raise ValueError('Access comparison requires two GET requests for the exact same resource URL.')
+        def credentials(info):
+            fields = []
+            for header in info.getHeaders():
+                if ':' in header:
+                    name, value = header.split(':', 1)
+                    if name.lower().strip() in ('authorization', 'cookie', 'x-api-key'):
+                        fields.append(name.lower().strip() + ':' + value.strip())
+            return '\n'.join(sorted(fields))
+        owner, other = credentials(a), credentials(b)
+        if not owner or owner == other:
+            raise ValueError('Set an authenticated owner baseline, then supply a request with different credentials or no credentials.')
+        if not self._scope.active_in_scope(url):
+            raise ValueError('Add the target to Burp Target > Scope before comparing access.')
+        return url
+
+    def submit_access_compare(self, first, second, expectation):
+        try:
+            url = self._access_pair(first, second)
+        except ValueError as error:
+            self._status(str(error))
+            return False
+        with self._lock:
+            if url in self._scan_urls:
+                self._last_status = 'A scan is already queued or running for this resource.'
+                return False
+            self._scan_urls.add(url)
+        queued = self._submit_task(_AccessCompareTask(self, first, second, expectation, self._store.generation))
+        if not queued:
+            with self._lock:
+                self._scan_urls.discard(url)
+        return queued
+
+    def _run_access_compare(self, first, second, expectation, generation):
+        url = str(self._helpers.analyzeRequest(first).getUrl())
+        try:
+            self._incr_active()
+            self._access_pair(first, second)
+            replies = []
+            for msg in (first, second):
+                if generation != self._store.generation or self._closed:
+                    return
+                reply = self._send_scoped(url, msg.getHttpService(), msg.getRequest())
+                if reply is None or reply.getResponse() is None:
+                    return
+                raw = reply.getResponse()
+                info = self._helpers.analyzeResponse(raw)
+                replies.append((reply, info.getStatusCode(), decode_response_body(raw, self._helpers, info)))
+            if generation != self._store.generation:
+                return
+            first_reply, a_status, a_body = replies[0]
+            second_reply, b_status, b_body = replies[1]
+            same = a_body is not None and b_body is not None and a_body == b_body
+            evidence = ('Owner HTTP %s; second session HTTP %s; bodies %s. Expected: %s. ' %
+                        (a_status, b_status, 'identical' if same else 'different or undecodable', expectation[:300]))
+            if 200 <= a_status < 300 and 200 <= b_status < 300:
+                evidence += 'Potential access-control issue only if the second identity is unauthorized; public responses and soft errors must be excluded.'
+            else:
+                evidence += 'No access bypass established; inspect the actual protected data and permissions.'
+            try:
+                second_reply = self._callbacks.saveBuffersToTempFiles(second_reply) or second_reply
+            except Exception:
+                pass
+            self._store.add_active_result(url, '-', 'IDOR / logic comparison', b_status, evidence, second_reply, generation)
+            self._status('Access comparison complete. Inspect results and verify the expected authorization rule.')
+        except Exception as error:
+            self._report_error('Access comparison', error)
+            self._status('Access comparison failed; check request selection, scope, and extension errors.')
+        finally:
+            with self._lock:
+                self._scan_urls.discard(url)
+            self._decr_active()
+            self._notify()
+
+    def status_text(self):
+        with self._lock:
+            return self._last_status
+
+    def _status(self, text):
+        with self._lock:
+            self._last_status = text
+        self._notify()
+
+    def _pace(self):
+        with self._request_lock:
+            delay = 0.3 - (time.time() - self._last_request)
+            if delay > 0:
+                time.sleep(delay)
+            self._last_request = time.time()
+
+    def _identity_request(self, request):
+        info = self._helpers.analyzeRequest(request)
+        headers = ArrayList()
+        for header in info.getHeaders():
+            if not header.lower().startswith(('accept-encoding:', 'content-length:', 'transfer-encoding:')):
+                headers.add(header)
+        headers.add('Accept-Encoding: identity')
+        text = self._helpers.bytesToString(request)
+        body = self._helpers.stringToBytes(text[info.getBodyOffset():])
+        return self._helpers.buildHttpMessage(headers, body)
+
+    def _send_scoped(self, url, service, request):
+        self._pace()
+        if not self._scope.active_in_scope(url):
+            self._status('Active request skipped: add this host to Burp Target > Scope.')
+            return None
+        return self._callbacks.makeHttpRequest(service, self._identity_request(request))
+
+    def submit_active_scan(self, msg):
+        info = self._helpers.analyzeRequest(msg)
+        url = str(info.getUrl())
+        if not self._scope.active_in_scope(url):
+            self._status('Scan blocked: add the target to Burp Target > Scope and check Hosts.')
+            return False
+        if str(info.getMethod()) != 'GET':
+            self._status('Scan skipped: selected-request checks currently support GET query parameters only.')
+            return False
+        with self._lock:
+            if url in self._scan_urls:
+                self._last_status = 'A scan is already queued or running for this URL.'
+                return False
+            self._scan_urls.add(url)
+        generation = self._store.generation
+        queued = self._submit_task(_ActiveScanTask(self, msg, generation))
+        if not queued:
+            with self._lock:
+                self._scan_urls.discard(url)
+        return queued
+
+    def _run_active_scan(self, msg, generation):
+        info = self._helpers.analyzeRequest(msg)
+        url = str(info.getUrl())
+        service = msg.getHttpService()
+        original = msg.getRequest()
+        def current():
+            return generation == self._store.generation and not self._closed
+        def send(request):
+            if not current():
+                return None
+            response = self._send_scoped(url, service, request)
+            if response is None or response.getResponse() is None:
+                return None
+            return response
+        def body(response):
+            raw = response.getResponse()
+            ri = self._helpers.analyzeResponse(raw)
+            return decode_response_body(raw, self._helpers, ri)
+        def result(parameter, test, response, evidence):
+            if not current():
+                return
+            status = self._helpers.analyzeResponse(response.getResponse()).getStatusCode()
+            try:
+                response = self._callbacks.saveBuffersToTempFiles(response) or response
+            except Exception:
+                pass
+            self._store.add_active_result(url, parameter, test, status, evidence, response, generation)
+        try:
+            self._incr_active()
+            baseline = send(original)
+            if baseline is None:
+                return
+            baseline_body = body(baseline)
+            if baseline_body is None:
+                result('-', 'Skipped', baseline, 'Unsupported content encoding; no body checks performed.')
+                return
+            parameters = []
+            seen = set()
+            for parameter in info.getParameters():
+                if parameter.getType() == 0 and parameter.getName() not in seen:
+                    parameters.append(parameter)
+                    seen.add(parameter.getName())
+                if len(parameters) == 5:
+                    break
+            for parameter in parameters:
+                for test, value in [('XSS reflection', 'reconswk_' + uuid.uuid4().hex[:16] + "<'\"&>"),
+                                    ('Error differential', str(parameter.getValue()) + "'")]:
+                    replacement = self._helpers.buildParameter(parameter.getName(), value, 0)
+                    request = self._helpers.updateParameter(original, replacement)
+                    response = send(request)
+                    if response is None:
+                        return
+                    response_body = body(response)
+                    if response_body is None:
+                        result(parameter.getName(), test, response, 'Skipped: unsupported content encoding.')
+                    elif test == 'XSS reflection':
+                        response_type = ''
+                        for header in self._helpers.analyzeResponse(response.getResponse()).getHeaders():
+                            if header.lower().startswith('content-type:'):
+                                response_type = header.split(':', 1)[1]
+                        result(parameter.getName(), test, response,
+                               reflection_evidence(value, response_body, response_type))
+                    else:
+                        errors = new_error_signatures(baseline_body, response_body)
+                        evidence = ('New error signature: ' + '; '.join(label + ': ' + quote for label, quote in errors)
+                                    if errors else 'No new known error signature versus fresh baseline.')
+                        result(parameter.getName(), test, response, evidence)
+            headers = ArrayList()
+            for header in info.getHeaders():
+                if not header.lower().startswith(('origin:', 'content-length:', 'transfer-encoding:')):
+                    headers.add(header)
+            origin = 'https://recon-scan.invalid'
+            headers.add('Origin: ' + origin)
+            raw_text = self._helpers.bytesToString(original)
+            req_body = self._helpers.stringToBytes(raw_text[info.getBodyOffset():])
+            response = send(self._helpers.buildHttpMessage(headers, req_body))
+            if response is not None:
+                ri = self._helpers.analyzeResponse(response.getResponse())
+                values = {}
+                for header in ri.getHeaders():
+                    if ':' in header:
+                        name, value = header.split(':', 1)
+                        values[name.lower().strip()] = value.strip()
+                evidence = 'No credentialed arbitrary-origin reflection observed.'
+                if (values.get('access-control-allow-origin') == origin and
+                        values.get('access-control-allow-credentials', '').lower() == 'true'):
+                    evidence = 'Origin reflected with credentials=true; verify sensitive authenticated response access.'
+                result('-', 'CORS origin', response, evidence)
+            if current():
+                self._status('Selected scan complete: %d query parameters checked; results are observations, not confirmed exploits.' % len(parameters))
+        except Exception as error:
+            self._report_error('Selected scan', error)
+            self._status('Selected scan failed; see extension errors.')
+        finally:
+            with self._lock:
+                self._scan_urls.discard(url)
+            self._decr_active()
+            self._notify()
 
     def set_result_callback(self, cb):
         self._on_result_callback = cb
@@ -886,6 +1146,7 @@ class ActiveEngine(object):
             return self._enabled.get(module_name, False)
 
     def shutdown(self):
+        self._closed = True
         try:
             self._executor.shutdownNow()
         except Exception:
@@ -911,6 +1172,7 @@ class ActiveEngine(object):
             if not self.is_module_enabled("js_fetch"):
                 return
             if not self._scope.active_in_scope(js_url):
+                self._status('JS fetch skipped: add this host to Burp Target > Scope.')
                 return
             if not self._store.try_claim_js_fetch(js_url):
                 return
@@ -926,7 +1188,7 @@ class ActiveEngine(object):
                 return
             http_service, req_bytes = svc
 
-            resp = self._callbacks.makeHttpRequest(http_service, req_bytes)
+            resp = self._send_scoped(js_url, http_service, req_bytes)
             if resp is None:
                 return
             try:
@@ -941,11 +1203,14 @@ class ActiveEngine(object):
             if response_bytes is None:
                 return
             resp_info = self._helpers.analyzeResponse(response_bytes)
-            body_offset = resp_info.getBodyOffset()
-            resp_str = self._helpers.bytesToString(response_bytes)
-            body = resp_str[body_offset:] if body_offset < len(resp_str) else ""
+            body = decode_response_body(response_bytes, self._helpers, resp_info)
+            if body is None:
+                self._status("JS scan skipped: unsupported response encoding.")
+                return
 
             self._js_scanner.scan(js_url, body, resp)
+            ReconAnalyzer(self._helpers, self._store, self._scope).analyze(
+                js_url, "GET", resp.getRequest(), response_bytes, resp)
 
             if self.is_module_enabled("method_probe"):
                 self.submit_method_probe(js_url)
@@ -961,6 +1226,7 @@ class ActiveEngine(object):
             if not self.is_module_enabled("method_probe"):
                 return
             if not self._scope.active_in_scope(url):
+                self._status('Probe skipped: add this host to Burp Target > Scope.')
                 return
             if not self._store.try_claim_probe(url):
                 return
@@ -976,7 +1242,7 @@ class ActiveEngine(object):
                 return
             http_service, req_bytes = svc
 
-            resp = self._callbacks.makeHttpRequest(http_service, req_bytes)
+            resp = self._send_scoped(url, http_service, req_bytes)
             allow_val = ""
             status = 0
             final_resp = resp
@@ -995,8 +1261,7 @@ class ActiveEngine(object):
                 svc2 = self._build_http_service(url, method="HEAD")
                 if svc2 is not None:
                     http_service2, req_bytes2 = svc2
-                    resp2 = self._callbacks.makeHttpRequest(
-                        http_service2, req_bytes2)
+                    resp2 = self._send_scoped(url, http_service2, req_bytes2)
                     if resp2 is not None and resp2.getResponse() is not None:
                         final_resp = resp2
                         ri2 = self._helpers.analyzeResponse(resp2.getResponse())
@@ -1038,7 +1303,7 @@ class ActiveEngine(object):
                 return
             http_service, req_bytes = svc
 
-            resp = self._callbacks.makeHttpRequest(http_service, req_bytes)
+            resp = self._send_scoped(url, http_service, req_bytes)
             if resp is not None and resp.getResponse() is not None:
                 try:
                     persisted = self._callbacks.saveBuffersToTempFiles(resp)
@@ -1072,11 +1337,6 @@ class ActiveEngine(object):
             from java.net import URL
             if not self._scope.active_in_scope(url_str):
                 return None
-            with self._request_lock:
-                delay = 0.3 - (time.time() - self._last_request)
-                if delay > 0:
-                    time.sleep(delay)
-                self._last_request = time.time()
             j_url = URL(url_str)
             protocol = j_url.getProtocol()
             host = j_url.getHost()
@@ -1119,6 +1379,23 @@ class ActiveEngine(object):
 
 
 # --- Runnable wrappers for thread pool tasks ---
+
+class _AccessCompareTask(Runnable):
+    def __init__(self, engine, first, second, expectation, generation):
+        self.args = (first, second, expectation, generation)
+        self.engine = engine
+
+    def run(self):
+        self.engine._run_access_compare(*self.args)
+
+
+class _ActiveScanTask(Runnable):
+    def __init__(self, engine, msg, generation):
+        self.engine, self.msg, self.generation = engine, msg, generation
+
+    def run(self):
+        self.engine._run_active_scan(self.msg, self.generation)
+
 
 class _JsFetchTask(Runnable):
     def __init__(self, engine, js_url):
@@ -1486,9 +1763,9 @@ class _TableMouseListener(MouseAdapter):
                 view.addActionListener(
                     _BtnListener(self._make_view(mr)))
                 menu.add(view)
-                ai = JMenuItem("Prepare AI review (redacted preview)")
-                ai.addActionListener(_BtnListener(lambda e: self._ui.prepare_ai(self._messages[mr])))
-                menu.add(ai)
+                scan = JMenuItem('Scan selected GET request')
+                scan.addActionListener(_BtnListener(lambda e: self._ui._scan_selected(self._messages[mr])))
+                menu.add(scan)
                 repeater = JMenuItem("Send original request to Repeater")
                 repeater.addActionListener(_BtnListener(lambda e: self._ui.send_repeater(self._messages[mr])))
                 menu.add(repeater)
@@ -1592,6 +1869,71 @@ def _table_scroll(table):
     return scroll
 
 
+class _ResultNavigator(JPanel):
+    """Explicit list + cards: independent of Burp's left-tab rendering delegate."""
+    def __init__(self):
+        JPanel.__init__(self, BorderLayout(8, 0))
+        self.labels = DefaultListModel()
+        self.nav = JList(self.labels)
+        self.nav.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
+        self.nav.setFixedCellHeight(34)
+        self.nav.setVisibleRowCount(9)
+        self.nav.setFixedCellWidth(215)
+        self.nav.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4))
+        navigation = JScrollPane(self.nav)
+        navigation.setPreferredSize(Dimension(230, 300))
+        navigation.setMinimumSize(Dimension(190, 100))
+        self.cards = JPanel(CardLayout())
+        self.listeners = []
+        self.add(navigation, BorderLayout.WEST)
+        self.add(self.cards, BorderLayout.CENTER)
+        self.nav.addListSelectionListener(_SelectionListener(self._changed))
+
+    def _changed(self):
+        index = self.getSelectedIndex()
+        if index >= 0:
+            self.cards.getLayout().show(self.cards, str(index))
+            for listener in self.listeners:
+                listener.stateChanged(None)
+
+    def addTab(self, title, component):
+        index = self.labels.size()
+        self.cards.add(component, str(index))
+        self.labels.addElement(title)
+        if index == 0:
+            self.nav.setSelectedIndex(0)
+
+    def setTitleAt(self, index, title):
+        self.labels.setElementAt(title, index)
+
+    def setSelectedIndex(self, index):
+        self.nav.setSelectedIndex(index)
+        self.nav.ensureIndexIsVisible(index)
+
+    def getSelectedIndex(self):
+        return self.nav.getSelectedIndex()
+
+    def getTabCount(self):
+        return self.labels.size()
+
+    def addChangeListener(self, listener):
+        self.listeners.append(listener)
+
+
+class _ResultFilter(RowFilter):
+    def __init__(self, text, hide_static=False):
+        self.text = unicode(text).lower()
+        self.hide_static = hide_static
+
+    def include(self, entry):
+        if self.hide_static:
+            path = urlsplit(unicode(entry.getStringValue(0))).path.lower()
+            if path.endswith(BINARY_EXTENSIONS + ('.css',)):
+                return False
+        return not self.text or any(self.text in unicode(entry.getStringValue(i)).lower()
+                                    for i in range(entry.getValueCount()))
+
+
 class _ReconTable(JTable):
     """Readable rows and a useful empty state in the actual table viewport."""
     def __init__(self, model):
@@ -1632,14 +1974,14 @@ class ReconUI(object):
         self.jsfind_msgs = []
         self.probe_msgs = []
         self.fuzz_msgs = []
+        self.param_msgs = []
+        self.active_msgs = []
+        self.pii_msgs = []
+        self.access_baseline = None
 
         self._refresh_pending = False
         self._refresh_dirty = False
         self._ui_refresh_lock = threading.Lock()
-        self._ai_generation = 0
-        self._ai_connection = None
-        self._ai_running = False
-        self._ai_worker = None
         self._build_ui()
 
     # ---- Non-editable table model ----
@@ -1712,9 +2054,6 @@ class ReconUI(object):
             btn.setContentAreaFilled(True)
             btn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR))
 
-        def style_cb(cb):
-            cb.setFont(Font("SansSerif", Font.PLAIN, 12))
-            cb.setForeground(ui.c_text)
 
         def style_tf(tf):
             tf.setFont(Font("Monospaced", Font.PLAIN, 12))
@@ -1749,6 +2088,15 @@ class ReconUI(object):
         self.clear_btn = JButton('Clear workspace')
         self.clear_btn.addActionListener(_BtnListener(self._on_clear))
         actions.add(self.clear_btn)
+        self.show_leaks_btn = JButton('Leaks (0)')
+        self.show_leaks_btn.addActionListener(_BtnListener(lambda e: self._show_category(3)))
+        actions.add(self.show_leaks_btn)
+        show_params = JButton('Parameters')
+        show_params.addActionListener(_BtnListener(lambda e: self._show_category(7)))
+        actions.add(show_params)
+        pii = JButton('PII')
+        pii.addActionListener(_BtnListener(lambda e: self._show_category(9)))
+        actions.add(pii)
         self.modules_toggle = JCheckBox('Active modules')
         actions.add(self.modules_toggle)
         self.metrics_toggle = JCheckBox('Show metrics')
@@ -1788,7 +2136,12 @@ class ReconUI(object):
         search.add(self.search_field, BorderLayout.CENTER)
         reset = JButton('Reset')
         reset.addActionListener(_BtnListener(lambda e: self.search_field.setText('')))
-        search.add(reset, BorderLayout.EAST)
+        self.hide_static = JCheckBox('Hide static assets', True)
+        self.hide_static.addActionListener(_BtnListener(lambda e: self._on_search_changed()))
+        extra = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0))
+        extra.add(self.hide_static)
+        extra.add(reset)
+        search.add(extra, BorderLayout.EAST)
         filters.add(search, BorderLayout.CENTER)
         top.add(filters)
         self.summary_label = JLabel('No results yet. Start capture or import proxy history.')
@@ -1822,7 +2175,7 @@ class ReconUI(object):
         # ================================================================
         # Tabbed data tables
         # ================================================================
-        self.tabs = JTabbedPane(JTabbedPane.LEFT)
+        self.tabs = _ResultNavigator()
 
         # 0 - Endpoints
         self.ep_model = self._make_model(["URL", "Method", "Parameters"])
@@ -1910,11 +2263,37 @@ class ReconUI(object):
         self.tabs.addTab("Method Fuzz Results (0)",
                          _table_scroll(self.fuzz_table))
 
+        self.param_model = self._make_model(['Source URL', 'Name', 'Location', 'Review focus', 'Regex evidence'])
+        self.param_table = _ReconTable(self.param_model)
+        self.param_sorter = TableRowSorter(self.param_model)
+        self.param_table.setRowSorter(self.param_sorter)
+        self.param_table.addMouseListener(_TableMouseListener(
+            self.param_table, self.param_model, self.param_sorter,
+            [('Name', 1)], self.param_msgs, url_col=0, ui=self))
+        self.tabs.addTab('Parameters (0)', _table_scroll(self.param_table))
+        self.active_model = self._make_model(['URL', 'Parameter', 'Check', 'Status', 'Evidence / outcome'])
+        self.active_table = _ReconTable(self.active_model)
+        self.active_sorter = TableRowSorter(self.active_model)
+        self.active_table.setRowSorter(self.active_sorter)
+        self.active_table.addMouseListener(_TableMouseListener(
+            self.active_table, self.active_model, self.active_sorter,
+            [('Evidence', 4)], self.active_msgs, url_col=0, ui=self))
+        self.tabs.addTab('Active scan (0)', _table_scroll(self.active_table))
+
+        self.pii_model = self._make_model(['PII type', 'Match value', 'Source URL'])
+        self.pii_table = _ReconTable(self.pii_model)
+        self.pii_sorter = TableRowSorter(self.pii_model)
+        self.pii_table.setRowSorter(self.pii_sorter)
+        self.pii_table.addMouseListener(_TableMouseListener(
+            self.pii_table, self.pii_model, self.pii_sorter, [('Value', 1)],
+            self.pii_msgs, url_col=2, leak_col=1, ui=self))
+        self.tabs.addTab('PII (0)', _table_scroll(self.pii_table))
+
         # ---- Style all tables ----
         all_tables = [
             self.ep_table, self.risk_table, self.js_table,
             self.leak_table, self.jsfind_table, self.probe_table,
-            self.fuzz_table
+            self.fuzz_table, self.param_table, self.active_table, self.pii_table
         ]
         for t in all_tables:
             t.setRowHeight(26)
@@ -1928,7 +2307,7 @@ class ReconUI(object):
         self._sorters = [
             self.ep_sorter, self.risk_sorter, self.js_sorter,
             self.leak_sorter, self.jsfind_sorter, self.probe_sorter,
-            self.fuzz_sorter
+            self.fuzz_sorter, self.param_sorter, self.active_sorter, self.pii_sorter
         ]
 
         self._table_specs = [
@@ -1938,7 +2317,10 @@ class ReconUI(object):
             (self.leak_table, self.leak_model, self.leaks_msgs, 2, 1),
             (self.jsfind_table, self.jsfind_model, self.jsfind_msgs, 2, None),
             (self.probe_table, self.probe_model, self.probe_msgs, 0, None),
-            (self.fuzz_table, self.fuzz_model, self.fuzz_msgs, 0, None)]
+            (self.fuzz_table, self.fuzz_model, self.fuzz_msgs, 0, None),
+            (self.param_table, self.param_model, self.param_msgs, 0, None),
+            (self.active_table, self.active_model, self.active_msgs, 0, None),
+            (self.pii_table, self.pii_model, self.pii_msgs, 2, 1)]
         for table, model, messages, url_col, leak_col in self._table_specs:
             table.setFont(UIManager.getFont('Table.font'))
             table.setRowHeight(28)
@@ -1951,12 +2333,15 @@ class ReconUI(object):
         investigate = JPanel(BorderLayout(6, 6))
         toolbar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 3))
         self.selection_buttons = []
-        for label, action in [('Open evidence', 'evidence'), ('Prepare AI review', 'ai'), ('Send to Repeater', 'repeater')]:
+        for label, action in [('Open evidence', 'evidence'), ('Scan selected', 'scan'), ('Send to Repeater', 'repeater'), ('Set owner baseline', 'baseline'), ('Compare access', 'compare')]:
             button = JButton(label)
             button.setEnabled(False)
             button.addActionListener(_BtnListener(lambda e, a=action: self._selected_action(a)))
             self.selection_buttons.append(button)
             toolbar.add(button)
+        cancel_scans = JButton('Cancel scans')
+        cancel_scans.addActionListener(_BtnListener(self._cancel_scans))
+        toolbar.add(cancel_scans)
         self.result_count = JLabel('0 shown / 0 total')
         toolbar.add(self.result_count)
         investigate.add(toolbar, BorderLayout.NORTH)
@@ -1975,18 +2360,69 @@ class ReconUI(object):
         investigate.add(split, BorderLayout.CENTER)
         self.tabs.addChangeListener(_TabChangeListener(self._selection_changed))
         self.workspace_tabs = JTabbedPane()
-        self.workspace_tabs.addTab('Investigate', investigate)
-        self.workspace_tabs.addTab('AI review', self._build_ai_panel())
+        self.workspace_tabs.addTab('Regex extraction & active scan', investigate)
         self.panel.add(top, BorderLayout.NORTH)
         self.panel.add(self.workspace_tabs, BorderLayout.CENTER)
         self.help_label = JLabel('Passive capture starts paused. Active modules send requests only within Burp scope.')
         self.help_label.setBorder(BorderFactory.createEmptyBorder(5, 12, 5, 12))
         self.panel.add(self.help_label, BorderLayout.SOUTH)
+        self._on_search_changed()
         self._selection_changed()
 
     # ================================================================
     # Callbacks
     # ================================================================
+
+    def set_access_baseline(self, msg):
+        info = self._extender._helpers.analyzeRequest(msg)
+        if str(info.getMethod()) != 'GET':
+            self.help_label.setText('Access baseline must be an authenticated GET request for the protected resource.')
+            return
+        self.access_baseline = msg
+        self.help_label.setText('Owner baseline saved. Select the exact same resource with another session, then Compare access.')
+
+    def compare_access(self, msg):
+        if self.access_baseline is None:
+            self.help_label.setText('First select an authenticated owner request and click Set owner baseline.')
+            return
+        try:
+            self._extender.engine._access_pair(self.access_baseline, msg)
+        except ValueError as error:
+            self.help_label.setText(str(error))
+            return
+        expectation = JOptionPane.showInputDialog(self.panel,
+            'Two fresh GET requests will be sent using the supplied sessions.\n'
+            'Describe the expected access rule (for example: user B must be denied):',
+            'Second session must not access this private resource')
+        if expectation is not None and unicode(expectation).strip():
+            self._extender.engine.submit_access_compare(self.access_baseline, msg, unicode(expectation).strip())
+            self._show_category(8)
+
+    def _show_category(self, index):
+        self.search_field.setText('')
+        self.tabs.setSelectedIndex(index)
+
+    def _scan_selected(self, msg):
+        info = self._extender._helpers.analyzeRequest(msg)
+        if str(info.getMethod()) != 'GET':
+            self.help_label.setText('Selected scan supports GET query parameters only. Use Repeater for other methods.')
+            return
+        if not self._scope.active_in_scope(str(info.getUrl())):
+            self.help_label.setText('Scan blocked: add the target to Burp Target > Scope and check the Hosts filter.')
+            return
+        answer = JOptionPane.showConfirmDialog(self.panel,
+            'Send up to 12 requests for this selected GET endpoint?\n'
+            'Checks: fresh baseline, marker reflection, error differential, and CORS.\n'
+            'Original authentication is retained. Results require manual verification.',
+            'Run scoped active scan', JOptionPane.YES_NO_OPTION)
+        if answer == JOptionPane.YES_OPTION:
+            self._extender.engine.submit_active_scan(msg)
+            self.help_label.setText(self._extender.engine.status_text())
+
+    def _cancel_scans(self, evt):
+        with self._store.lock:
+            self._store.generation += 1
+        self.help_label.setText('Selected scans cancelled. An in-flight request may finish; no further selected-scan requests will be sent.')
 
     def _show_section(self, section, visible):
         section.setVisible(visible)
@@ -2014,7 +2450,7 @@ class ReconUI(object):
         for button in self.selection_buttons:
             button.setEnabled(enabled)
         if selected is None:
-            self.inspector.setText('Select a result to inspect its evidence.\n\nUse Open evidence for the native request/response viewer, or Prepare AI review to inspect redacted outbound context.')
+            self.inspector.setText('Select a result to inspect its evidence.\n\nUse Open evidence for the native request/response viewer, or Scan selected to run bounded active checks on an in-scope GET request.')
         else:
             table, model, messages, url_col, leak_col = self._table_specs[self.tabs.getSelectedIndex()]
             row = table.convertRowIndexToModel(table.getSelectedRow())
@@ -2037,10 +2473,14 @@ class ReconUI(object):
         msg, url, leak, is_js = selected
         if action == 'evidence':
             self.open_popup(msg, url, is_js, leak)
-        elif action == 'ai':
-            self.prepare_ai(msg)
+        elif action == 'scan':
+            self._scan_selected(msg)
         elif action == 'repeater':
             self.send_repeater(msg)
+        elif action == 'baseline':
+            self.set_access_baseline(msg)
+        elif action == 'compare':
+            self.compare_access(msg)
 
     def _remember_selection(self):
         rows = []
@@ -2065,75 +2505,8 @@ class ReconUI(object):
                         table.setRowSelectionInterval(vr, vr)
                     break
 
-    def _build_ai_panel(self):
-        panel = JPanel(BorderLayout(8, 8))
-        panel.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12))
-        settings = JPanel(GridLayout(0, 1, 0, 6))
-        settings.setBorder(BorderFactory.createTitledBorder('1. Configure provider'))
-        self.ai_endpoint_field = JTextField('http://127.0.0.1:11434/v1/chat/completions')
-        self.ai_model_field = JTextField('')
-        self.ai_key_field = JPasswordField()
-        for label, field in [('Chat completions endpoint', self.ai_endpoint_field),
-                             ('Model name', self.ai_model_field),
-                             ('API key (memory only; optional locally)', self.ai_key_field)]:
-            row = JPanel(BorderLayout(8, 0))
-            caption = JLabel(label)
-            caption.setPreferredSize(Dimension(300, 28))
-            row.add(caption, BorderLayout.WEST)
-            row.add(field, BorderLayout.CENTER)
-            settings.add(row)
-            field.getDocument().addDocumentListener(_DocListener(self._reset_ai_consent))
-        panel.add(settings, BorderLayout.NORTH)
-        self.ai_context = JTextArea()
-        self.ai_context.setLineWrap(True)
-        self.ai_context.setWrapStyleWord(True)
-        self.ai_context.getDocument().addDocumentListener(_DocListener(self._reset_ai_consent))
-        self.ai_output = JTextArea()
-        self.ai_output.setEditable(False)
-        self.ai_output.setLineWrap(True)
-        self.ai_output.setWrapStyleWord(True)
-        preview = JPanel(BorderLayout())
-        preview.setBorder(BorderFactory.createTitledBorder('2. Review outbound context (editable)'))
-        preview.add(JScrollPane(self.ai_context), BorderLayout.CENTER)
-        results = JPanel(BorderLayout())
-        results.setBorder(BorderFactory.createTitledBorder('3. AI hypotheses (unverified)'))
-        results.add(JScrollPane(self.ai_output), BorderLayout.CENTER)
-        split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, preview, results)
-        split.setDividerLocation(650)
-        split.setResizeWeight(0.5)
-        panel.add(split, BorderLayout.CENTER)
-        bottom = JPanel(GridLayout(0, 1))
-        self.ai_context_count = JLabel('0 / 24000 characters. Select a result, then choose Prepare AI review.')
-        bottom.add(self.ai_context_count)
-        self.ai_consent = JCheckBox('I reviewed this context and approve sending it to the configured endpoint')
-        self.ai_consent.addActionListener(_BtnListener(lambda e: self._update_ai_state()))
-        bottom.add(self.ai_consent)
-        actions = JPanel(FlowLayout(FlowLayout.LEFT))
-        self.ai_send = JButton('Analyze reviewed context')
-        self.ai_send.setEnabled(False)
-        self.ai_send.addActionListener(_BtnListener(self._send_ai))
-        actions.add(self.ai_send)
-        cancel = JButton('Cancel AI')
-        cancel.addActionListener(_BtnListener(self._cancel_ai))
-        actions.add(cancel)
-        bottom.add(actions)
-        panel.add(bottom, BorderLayout.SOUTH)
-        self.ai_context.setText('')
-        self.ai_output.setText('AI findings will appear here. No traffic is sent until you review the context and approve sending it.')
-        return panel
 
-    def _update_ai_state(self):
-        if not hasattr(self, 'ai_send'):
-            return
-        count = len(unicode(self.ai_context.getText()))
-        self.ai_context_count.setText('%d / 24000 characters. Review sensitive data before sending.' % count)
-        self.ai_send.setEnabled(not self._ai_running and self.ai_consent.isSelected()
-                                and 0 < count <= 24000 and bool(self.ai_model_field.getText().strip()))
 
-    def _reset_ai_consent(self):
-        if hasattr(self, 'ai_consent'):
-            self.ai_consent.setSelected(False)
-            self._update_ai_state()
 
     def send_repeater(self, msg):
         service = msg.getHttpService()
@@ -2141,138 +2514,9 @@ class ReconUI(object):
                                                 service.getProtocol() == 'https',
                                                 msg.getRequest(), 'Recon ' + VERSION)
 
-    def prepare_ai(self, msg):
-        self._cancel_ai(None)
-        try:
-            self.ai_context.setText(build_ai_context(msg, self._extender._helpers))
-            self.ai_context.setCaretPosition(0)
-            self.ai_output.setText('Review the exact outbound context above, then configure your model and approve sending. All results are unverified hypotheses.')
-            self.workspace_tabs.setSelectedIndex(1)
-        except Exception as e:
-            self.ai_output.setText('Cannot prepare context: ' + str(e))
 
-    def _cancel_ai(self, evt):
-        self._ai_generation += 1
-        self._reset_ai_consent()
-        connection = self._ai_connection
-        if connection is not None:
-            # Disconnect off the EDT; some providers block while closing streams.
-            worker = threading.Thread(target=connection.disconnect)
-            worker.setDaemon(True)
-            worker.start()
-        if hasattr(self, 'ai_output'):
-            self.ai_output.setText('AI cancelled / context reset. A running transport may take up to its timeout to close.')
 
-    def _send_ai(self, evt):
-        if self._ai_running:
-            self.ai_output.setText('A review is still running or cancelling; wait for it to finish.')
-            return
-        if not self.ai_consent.isSelected():
-            self.ai_output.setText('Review the context and approve sending first.')
-            return
-        try:
-            endpoint = ai_endpoint(unicode(self.ai_endpoint_field.getText()))
-            model = unicode(self.ai_model_field.getText()).strip()
-            context = unicode(self.ai_context.getText())
-            if not model or not context.strip() or len(context) > 24000:
-                raise ValueError('Enter a model and 1-24000 characters of reviewed context.')
-        except Exception as e:
-            self.ai_output.setText(str(e))
-            return
-        password = self.ai_key_field.getPassword()
-        key = ''.join(unicode(c) for c in password)
-        for i in range(len(password)):
-            password[i] = '\0'
-        self._ai_generation += 1
-        generation = self._ai_generation
-        self._ai_running = True
-        self.ai_send.setEnabled(False)
-        self._reset_ai_consent()
-        self.ai_output.setText('Analyzing reviewed context...')
-        self._ai_worker = threading.Thread(target=self._ai_request,
-                                           args=(endpoint, model, key, context, generation))
-        self._ai_worker.setDaemon(True)
-        self._ai_worker.start()
 
-    def _ai_request(self, endpoint, model, key, context, generation):
-        from java.net import URL
-        from java.lang import String
-        from java.io import ByteArrayOutputStream
-        from jarray import zeros
-        conn = None
-        output = ''
-        try:
-            if generation != self._ai_generation:
-                return
-            conn = URL(endpoint).openConnection()
-            self._ai_connection = conn
-            conn.setConnectTimeout(10000)
-            conn.setReadTimeout(45000)
-            conn.setInstanceFollowRedirects(False)
-            conn.setRequestMethod('POST')
-            conn.setDoOutput(True)
-            conn.setRequestProperty('Content-Type', 'application/json')
-            if key:
-                conn.setRequestProperty('Authorization', 'Bearer ' + key)
-            payload = json.dumps({'model': model, 'temperature': 0, 'max_tokens': 1800,
-                                  'messages': [{'role': 'system', 'content': AI_SYSTEM_PROMPT},
-                                               {'role': 'user', 'content': context}]})
-            data = String(payload).getBytes('UTF-8')
-            conn.setFixedLengthStreamingMode(len(data))
-            stream = conn.getOutputStream()
-            try:
-                stream.write(data)
-            finally:
-                stream.close()
-            code = conn.getResponseCode()
-            if code != 200:
-                raise ValueError('Provider HTTP %s; check endpoint, model, credentials and limits.' % code)
-            stream = conn.getInputStream()
-            buffer = zeros(4096, 'b')
-            content = ByteArrayOutputStream()
-            deadline = time.time() + 60
-            try:
-                while True:
-                    if generation != self._ai_generation:
-                        return
-                    if time.time() > deadline:
-                        raise ValueError('Provider response exceeded the time limit.')
-                    count = stream.read(buffer)
-                    if count < 0:
-                        break
-                    if content.size() + count > 1000000:
-                        raise ValueError('Provider response exceeds 1 MB.')
-                    content.write(buffer, 0, count)
-            finally:
-                stream.close()
-            decoded = json.loads(unicode(content.toString('UTF-8')))
-            findings = validate_ai_findings(decoded['choices'][0]['message']['content'], context)
-            blocks = ['AI HYPOTHESES - NOT VERIFIED VULNERABILITIES']
-            if not findings:
-                blocks.append('No supported hypotheses returned. This does not establish that the endpoint is secure.')
-            for f in findings:
-                blocks.append('%s\nCategory: %s | Confidence: %s\nEvidence: %s\n\n%s\n\nSuggested verification: %s' %
-                              (f['title'], f['category'], f['confidence'], f['evidence'], f['explanation'], f['verification']))
-            output = '\n\n---\n\n'.join(blocks)
-        except ValueError as e:
-            output = 'AI review failed: ' + str(e)
-        except Exception as e:
-            # Never echo provider bodies, request headers, or credentials.
-            output = 'AI transport/protocol failed (%s). Check provider settings and connectivity.' % type(e).__name__
-        finally:
-            if conn is not None:
-                try:
-                    conn.disconnect()
-                except Exception:
-                    pass
-            self._ai_connection = None
-            def finish():
-                self._ai_running = False
-                self._update_ai_state()
-                if generation == self._ai_generation:
-                    self.ai_output.setText(output)
-                    self.ai_output.setCaretPosition(0)
-            SwingUtilities.invokeLater(_UiCall(finish))
 
     def _on_toggle(self, evt):
         self._extender.toggle_enabled()
@@ -2282,7 +2526,7 @@ class ReconUI(object):
             self.panel, "Clear all collected recon data?",
             "Confirm Clear", JOptionPane.YES_NO_OPTION)
         if r == JOptionPane.YES_OPTION:
-            self._cancel_ai(None)
+            self.access_baseline = None
             self._store.clear()
             self.refresh_all()
 
@@ -2314,7 +2558,7 @@ class ReconUI(object):
         if enabled:
             self.help_label.setText('Active modules enabled: ' + ', '.join(enabled) + '. Requests require Burp scope.')
         else:
-            self.help_label.setText('Active modules off. Select a result for evidence, Repeater or AI review.')
+            self.help_label.setText('Active modules off. Select a result for evidence, Repeater or active scanning.')
 
     def _on_scope_changed(self):
         try:
@@ -2323,24 +2567,12 @@ class ReconUI(object):
             pass
 
     def _on_search_changed(self):
-        try:
-            text = self.search_field.getText()
-            if not text:
-                rf = None
-            else:
-                escaped = re.escape(text)
-                try:
-                    rf = RowFilter.regexFilter("(?i)" + escaped)
-                except Exception:
-                    rf = RowFilter.regexFilter("(?i)" + re.escape(text))
-            for s in self._sorters:
-                try:
-                    s.setRowFilter(rf)
-                except Exception:
-                    pass
-            self._selection_changed()
-        except Exception:
-            pass
+        if not hasattr(self, '_sorters'):
+            return
+        text = unicode(self.search_field.getText())
+        for sorter in self._sorters:
+            sorter.setRowFilter(_ResultFilter(text, self.hide_static.isSelected() and sorter == self.ep_sorter))
+        self._selection_changed()
 
     def set_toggle_state(self, enabled):
         self.lbl_status.setText("Capture running" if enabled else "Capture paused")
@@ -2399,6 +2631,8 @@ class ReconUI(object):
                 jsfind_snap = list(self._store.js_findings)
                 probe_snap = list(self._store.probe_results)
                 fuzz_snap = list(self._store.fuzz_results)
+                param_snap = list(self._store.parameters)
+                active_snap = list(self._store.active_results)
 
             # ---- Rebuild Endpoints table ----
             new_ep = []
@@ -2468,6 +2702,28 @@ class ReconUI(object):
                 new_fuzz.append(fz.get("msg"))
             self.fuzz_msgs[:] = new_fuzz
 
+            self.param_model.setRowCount(0)
+            self.param_msgs[:] = []
+            for row in param_snap:
+                self.param_model.addRow([row['url'], row['name'], row['location'], ('IDOR / access control' if row['location'] == 'Path candidate' else parameter_focus(row['name'])), row['evidence']])
+                self.param_msgs.append(row['msg'])
+            self.active_model.setRowCount(0)
+            self.active_msgs[:] = []
+            for row in active_snap:
+                self.active_model.addRow([row['url'], row['parameter'], row['test'], str(row['status']), row['evidence']])
+                self.active_msgs.append(row['msg'])
+            self.tabs.setTitleAt(7, 'Parameters (%d)' % len(param_snap))
+            self.tabs.setTitleAt(8, 'Active scan (%d)' % len(active_snap))
+            self.show_leaks_btn.setText('Leaks (%d)' % len(leak_snap))
+            self.pii_model.setRowCount(0)
+            self.pii_msgs[:] = []
+            pii_types = set(['Email', 'Iranian Mobile', 'Iranian National ID', 'International Phone',
+                             'Iranian IBAN', 'Possible payment card (Luhn)']) | PII_LABELS
+            for row in leak_snap:
+                if row['type'] in pii_types:
+                    self.pii_model.addRow([row['type'], row['value'], row['url']])
+                    self.pii_msgs.append(row['msg'])
+            self.tabs.setTitleAt(9, 'PII (%d)' % len(self.pii_msgs))
             # ---- Update metric cards ----
             counts = self._store.snapshot_counts()
             n_ep      = counts[0]
@@ -2502,8 +2758,8 @@ class ReconUI(object):
             except Exception:
                 pass
 
-            self.summary_label.setText('%d endpoints  /  %d scripts  /  %d observations  /  %d leaks' %
-                                       (n_ep, n_js, n_findings, n_leak))
+            self.summary_label.setText('%d endpoints / %d parameters / %d scripts / %d observations / %d leaks' %
+                                       (n_ep, len(param_snap), n_js, n_findings, n_leak))
             self._restore_selection(selections)
             # ---- Update status indicator ----
             active = self._extender.engine.get_active_count()
@@ -2514,6 +2770,9 @@ class ReconUI(object):
             else:
                 self.lbl_status.setText("Capture running" if getattr(self._extender, "enabled", False) else "Capture paused")
                 self.lbl_status.setForeground(self.c_text_sec)
+
+            if hasattr(self._extender.engine, 'status_text'):
+                self.help_label.setText(self._extender.engine.status_text())
 
             # Color leak card amber if leaks found
             if n_leak > 0:
@@ -2550,6 +2809,14 @@ class _ContextMenuFactory(IContextMenuFactory):
             item.addActionListener(
                 _BtnListener(self._make_handler(invocation)))
             items.add(item)
+            selected = invocation.getSelectedMessages()
+            if selected is not None and len(selected) > 0:
+                baseline = JMenuItem('Recon: set owner baseline')
+                baseline.addActionListener(_BtnListener(lambda e: self._ext.ui.set_access_baseline(selected[0])))
+                items.add(baseline)
+                compare = JMenuItem('Recon: compare access with owner baseline')
+                compare.addActionListener(_BtnListener(lambda e: self._ext.ui.compare_access(selected[0])))
+                items.add(compare)
         except Exception:
             pass
         return items
@@ -2640,6 +2907,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab,
 
     # ---- IHttpListener ----
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
+        # Avoid recursively probing traffic created by extension callbacks.
+        if toolFlag == IBurpExtenderCallbacks.TOOL_EXTENDER:
+            return
         if not self.enabled:
             return
         if messageIsRequest:
@@ -2653,7 +2923,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab,
     # ---- IExtensionStateListener ----
     def extensionUnloaded(self):
         try:
-            SwingUtilities.invokeLater(_UiCall(lambda: self.ui._cancel_ai(None)))
             self.engine.shutdown()
         except Exception:
             pass
@@ -2719,7 +2988,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab,
         do_it = False
         with self._refresh_lock:
             self._refresh_counter += 1
-            if self._refresh_counter >= self._refresh_threshold:
+            if self._refresh_counter >= 1:
                 self._refresh_counter = 0
                 do_it = True
         if do_it:

@@ -1,3 +1,25 @@
+# 3.2.1 — Persian / Iranian regex catalog and repository cleanup
+
+- Add Persian/Arabic-Indic digit normalization, encoded Persian evidence and locale-aware PII rules.
+- Add grouped Sheba, known-prefix/Luhn Iranian cards, landlines and context-labeled postal codes.
+- Add Persian parameter-name decoding and IDOR/XSS/logic/PII hints.
+- Decode byte-preserving Burp text using response charset/UTF-8 before extraction.
+- Preserve original matched values and avoid duplicate generic card/phone rows for identical locale matches.
+- Organize docs/images, remove superseded constants/helpers, add contributor instructions and cache cleanup tooling.
+
+# 3.2.0 — Regex, IDOR/XSS review and PII
+
+- Remove provider/AI code, settings and review actions.
+- Fix inaccessible result categories with an explicit scrollable list/card navigator and direct Leaks/PII buttons.
+- Refresh after each analyzed message; hide static endpoint noise by default.
+- Add observed/candidate parameter extraction, path identifiers and access-control/XSS/business-logic focus hints.
+- Add scoped selected-GET scans with reflection/escaping, fresh-baseline error differentials and CORS checks.
+- Add two-session owner-baseline comparisons with operator-supplied expected access rules.
+- Add dedicated PII results, checksum-validated card/IBAN matches, response-header scanning and bounded gzip/deflate decoding.
+- Report unsupported compression and skipped out-of-scope activity; scan already-captured JavaScript directly.
+- Preserve authentication, request identity encoding, enforce scope at send time and invalidate selected scans on cancellation/clear.
+- Add disposable-target tests for access comparison, scanner boundaries, compression and visible PII results.
+
 # Unreleased — Foundation refactoring
 
 - Maintain pure helper modules separately from Burp/Swing code under `recon/`.

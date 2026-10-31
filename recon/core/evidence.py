@@ -30,3 +30,25 @@ def is_valid_iranian_national_id(nid):
             return check == (11 - r)
     except Exception:
         return False
+
+
+def valid_luhn(value):
+    digits = ''.join(c for c in value if c.isdigit())
+    if not 13 <= len(digits) <= 19 or len(set(digits)) == 1:
+        return False
+    total = 0
+    for i, char in enumerate(reversed(digits)):
+        number = int(char)
+        if i % 2:
+            number *= 2
+            if number > 9:
+                number -= 9
+        total += number
+    return total % 10 == 0
+
+
+def valid_iranian_iban(value):
+    value = value.replace(' ', '').upper()
+    if len(value) != 26 or not value.startswith('IR') or not value[2:].isdigit():
+        return False
+    return int(value[4:] + '1827' + value[2:4]) % 97 == 1

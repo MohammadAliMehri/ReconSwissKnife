@@ -1,44 +1,65 @@
-# Pure development modules: runnable in CPython 3 and Jython 2.7 without Burp.
 import json
 import os
 import sys
 import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from recon.core import evidence, redaction, urls
-from recon.ai import protocol, context
+from recon.core import evidence, extraction
 
-FUNCTIONS = {
-    'cookie_attributes': evidence.cookie_attributes,
-    'method_result_label': evidence.method_result_label,
-    'is_valid_iranian_national_id': evidence.is_valid_iranian_national_id,
-    'redact_ai_text': redaction.redact_ai_text,
-    'ai_endpoint': urls.ai_endpoint,
-    'validate_ai_findings': protocol.validate_ai_findings,
-}
+FUNCTIONS = {name: getattr(evidence, name) for name in ('cookie_attributes', 'method_result_label', 'is_valid_iranian_national_id')}
 
 class CoreTests(unittest.TestCase):
-    def test_pre_refactor_baseline(self):
-        path = os.path.join(os.path.dirname(__file__), 'fixtures', 'core_cases.json')
-        with open(path) as fixture:
+    def test_retained_baseline(self):
+        with open(os.path.join(os.path.dirname(__file__), 'fixtures', 'core_cases.json')) as fixture:
             cases = json.load(fixture)
         for case in cases:
-            fn = FUNCTIONS[case['function']]
-            if 'error' in case:
-                self.assertRaises(ValueError, fn, *case['args'])
-            else:
-                result = fn(*case['args'])
-                if isinstance(result, set): result = sorted(result)
-                self.assertEqual(case['expected'], result, case['function'])
-        self.assertEqual(36, len(cases))
+            actual = FUNCTIONS[case['function']](*case['args'])
+            if isinstance(actual, set): actual = sorted(actual)
+            self.assertEqual(case['expected'], actual)
+        self.assertEqual(14, len(cases))
 
-    def test_context_formatting(self):
-        actual = context.format_ai_context('GET', 'https://u:p@example.test/a?token=fake#fragment', 200,
-                    ['Content-Type: text/plain', 'Set-Cookie: secret=fake'], 'Contact user@example.test')
-        self.assertEqual('GET https://example.test/a?token=[REDACTED]\nHTTP status: 200\nContent-Type: text/plain\n\nResponse body (truncated):\nContact [REDACTED_EMAIL]', actual)
+    def test_request_parameters(self):
+        rows = extraction.extract_parameters('https://example.test/?user%5Bid%5D=1&blank=&flag',
+                'password=x&scope=read', 'application/x-www-form-urlencoded')
+        self.assertEqual(set(['user[id]', 'blank', 'flag', 'password', 'scope']), set(r['name'] for r in rows))
+        rows = extraction.extract_parameters('https://example.test', '{"user":{"id":1},"active":true}', 'application/json')
+        self.assertEqual(set(['user','id','active']), set(r['name'] for r in rows))
+        rows = extraction.extract_parameters('https://example.test', 'Content-Disposition: form-data; name="upload"; filename="x"', 'multipart/form-data')
+        self.assertEqual('upload', rows[0]['name'])
 
-    def test_body_limit_and_ipv6(self):
-        actual = context.format_ai_context('GET', 'http://[::1]:8080/a', 200, [], 'a'*13000)
-        self.assertTrue(actual.startswith('GET http://[::1]:8080/a'))
-        self.assertEqual(12000, len(actual.split('Response body (truncated):\n')[1]))
+    def test_response_candidates(self):
+        rows = extraction.extract_parameters('https://example.test', response_body='<input name="csrf"><select name="role"></select><script>params.get("page")</script>', response_type='text/html')
+        self.assertEqual(set(['csrf','role','page']), set(r['name'] for r in rows))
+        self.assertTrue(all('candidate' in r['location'] for r in rows))
+        self.assertEqual([], extraction.extract_parameters('https://example.test', response_body='<input name="bad">', response_type='image/png'))
+
+    def test_bounded_and_deduplicated(self):
+        rows = extraction.extract_parameters('https://example.test/?q=1&q=2', response_body='<input name="q">'*1000, response_type='text/html')
+        self.assertEqual(2, len(rows))
+        rows = extraction.extract_parameters('https://example.test/?' + '&'.join('q%d=1'%i for i in range(1000)))
+        self.assertEqual(500, len(rows))
+
+    def test_focus_and_xss_context(self):
+        self.assertIn('IDOR', extraction.parameter_focus('userId'))
+        self.assertIn('Business logic', extraction.parameter_focus('discount'))
+        self.assertIn('XSS', extraction.parameter_focus('comment'))
+        value = "marker<'\"&>"
+        self.assertIn('Unescaped', extraction.reflection_evidence(value, value, 'text/html'))
+        self.assertIn('escaping', extraction.reflection_evidence(value, 'marker&lt;', 'text/html'))
+        self.assertIn('not XSS', extraction.reflection_evidence(value, value, 'application/json'))
+        rows=extraction.extract_parameters('https://example.test/users/123/profile')
+        self.assertEqual('Path candidate',rows[0]['location'])
+
+    def test_pii_checksums(self):
+        self.assertTrue(evidence.valid_luhn('4111 1111 1111 1111'))
+        self.assertFalse(evidence.valid_luhn('4111 1111 1111 1112'))
+        self.assertFalse(evidence.valid_luhn('0000000000000000'))
+        self.assertTrue(evidence.valid_iranian_iban('IR062960000000100324200001'))
+        self.assertFalse(evidence.valid_iranian_iban('IR062960000000100324200002'))
+
+    def test_differential_errors(self):
+        self.assertEqual([], extraction.new_error_signatures('SQLSTATE[42000]', 'SQLSTATE[42000]'))
+        self.assertEqual('SQL error', extraction.new_error_signatures('OK', 'SQLSTATE[42000]')[0][0])
+        self.assertEqual('marker', extraction.reflected_marker('marker', 'echo marker'))
+        self.assertIsNone(extraction.reflected_marker('marker', 'no reflection'))
 
 if __name__ == '__main__': unittest.main()

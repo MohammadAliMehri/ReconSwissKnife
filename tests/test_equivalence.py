@@ -6,7 +6,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ReconSwissKnife_v3 as bundled
 from recon.burp import extension as source
-from recon.ai.context import format_ai_context
+from recon.core.extraction import extract_parameters
 
 class EquivalenceTests(unittest.TestCase):
     def test_baseline_on_both_entrypoints(self):
@@ -23,9 +23,10 @@ class EquivalenceTests(unittest.TestCase):
                     self.assertEqual(case['expected'], actual)
         self.assertEqual(source.VERSION, bundled.VERSION)
 
-    def test_context_parity(self):
-        args = ('GET', 'https://example.test/a?key=fake', 200, ['Content-Type: text/plain'], 'password=fake')
-        self.assertEqual(format_ai_context(*args), bundled.format_ai_context(*args))
-        self.assertEqual(source.AI_SYSTEM_PROMPT, bundled.AI_SYSTEM_PROMPT)
+    def test_regex_extraction_parity(self):
+        args = ('https://example.test/?name=x', '{"id":1}', 'application/json')
+        self.assertEqual(extract_parameters(*args), bundled.extract_parameters(*args))
+        self.assertFalse(hasattr(bundled, 'AI_SYSTEM_PROMPT'))
+        self.assertFalse(hasattr(source.ReconUI, 'prepare_ai'))
 
 if __name__ == '__main__': unittest.main()

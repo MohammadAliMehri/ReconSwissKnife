@@ -7,12 +7,9 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULES = (
-    'recon.core.compat',
     'recon.core.evidence',
-    'recon.core.redaction',
-    'recon.core.urls',
-    'recon.ai.protocol',
-    'recon.ai.context',
+    'recon.core.iranian',
+    'recon.core.extraction',
     'recon.burp.extension',
 )
 ARTIFACT = ROOT / 'ReconSwissKnife_v3.py'

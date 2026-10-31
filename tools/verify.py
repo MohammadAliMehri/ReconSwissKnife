@@ -26,7 +26,7 @@ def main():
     for jar in (jython, burp):
         if not jar.is_file(): parser.error('Missing JAR: ' + str(jar))
     run([sys.executable, 'tools/bundle.py', '--check'], 'Check generated artifact')
-    for name in ('test_core.py', 'test_bundle.py'):
+    for name in ('test_core.py', 'test_iranian.py', 'test_bundle.py'):
         run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-p', name], 'Python 3: ' + name)
     with tempfile.TemporaryDirectory(prefix='recon-verify-') as temp:
         cache = Path(temp) / 'cache'
@@ -36,8 +36,10 @@ def main():
         env = os.environ.copy()
         env.pop('RECON_TEST_TARGET', None)
         run(core + ['tests/test_core.py'], 'Jython pure modules without Burp API', env=env)
+        run(core + ['tests/test_iranian.py'], 'Jython Persian/Iranian regex fixtures', env=env)
         run(runtime + ['tests/test_equivalence.py'], 'Jython source/artifact equivalence', env=env)
         run(runtime + ['tests/test_extension.py'], 'Jython bundled extension regressions', env=env)
+        run(runtime + ['tests/test_active_scan.py'], 'Jython selected active scan against a loopback fixture', env=env)
         env['RECON_TEST_TARGET'] = 'source'
         run(runtime + ['tests/test_extension.py'], 'Jython modular entry point regressions', env=env)
         standalone = Path(temp) / 'standalone'
@@ -59,8 +61,8 @@ class Ext(object): pass
 ext = Ext(); ext.store = r.DataStore(); ext.scope = r.ScopeFilter()
 ui = []
 SwingUtilities.invokeAndWait(r._UiCall(lambda: ui.append(r.ReconUI(ext))))
-assert ui[0].workspace_tabs.getTabCount() == 2
-assert ui[0].tabs.getTabCount() == 7
+assert ui[0].workspace_tabs.getTabCount() == 1
+assert ui[0].tabs.getTabCount() == 10
 print('Standalone artifact imports and builds Swing UI without the source package.')
 '''
         env.pop('RECON_TEST_TARGET', None)
