@@ -1,11 +1,11 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Platform-Burp_Suite-orange?style=for-the-badge" alt="Platform">
   <img src="https://img.shields.io/badge/Language-Jython_2.7-blue?style=for-the-badge" alt="Language">
-  <img src="https://img.shields.io/badge/Version-3.0-brightgreen?style=for-the-badge" alt="Version">
+  <img src="https://img.shields.io/badge/Version-3.1.0-brightgreen?style=for-the-badge" alt="Version">
   <img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="License">
 </p>
 
-# 🔪 Recon Swiss Knife Pro v3
+# 🔪 Recon Swiss Knife Pro 3.1.0
 
 ### Semi-Active Security Recon & Method Fuzzer for Burp Suite
 
@@ -19,8 +19,8 @@
 - **Endpoint & Parameter Extraction** — Automatically collects all URLs, query parameters, POST body parameters, and JSON keys from proxied traffic.
 - **JavaScript File Discovery** — Detects `.js` files from URL paths and HTML `<script src="">` tags.
 - **HTTP Method Detection** — Flags risky HTTP methods (`PUT`, `DELETE`, `TRACE`, `PATCH`, `OPTIONS`, `DEBUG`, `CONNECT`).
-- **Security Header Auditing** — Checks for missing or misconfigured `X-Frame-Options`, `Content-Security-Policy`, `Strict-Transport-Security`, `X-Content-Type-Options`, and `X-XSS-Protection`.
-- **Cookie Security Analysis** — Detects cookies missing `Secure` or `HttpOnly` flags.
+- **Security Header Auditing** — Checks CSP/framing policies for HTML, HSTS for HTTPS, and `X-Content-Type-Options`. Missing obsolete `X-XSS-Protection` is no longer flagged.
+- **Cookie Security Analysis** — Parses attributes to detect missing `Secure` on HTTPS, `HttpOnly`, and explicit `SameSite`. Cookie values cannot spoof attribute presence.
 
 ### 🇮🇷 Iranian Target Focus
 - **National ID Validation** — Detects 10-digit Iranian National ID numbers with full checksum verification.
@@ -47,15 +47,15 @@
 ### ⚡ Active Cross-Method Fuzzer
 - **Right-Click Fuzzing** — Select any endpoint row, right-click → *"Test Risky Methods (Fuzz Endpoint)"*.
 - **Method Coverage** — Sends `PUT`, `DELETE`, `PATCH`, `DEBUG`, and `TRACE` requests.
-- **Bypass Detection** — Flags responses with status codes `200`, `201`, or `204` as **"VULNERABLE (Bypass Confirmed)"**.
+- **Evidence Labels** — Successful status codes are labeled **"Method accepted - impact unverified"**. A successful status alone does not prove a bypass.
 - **Full Logging** — All fuzz results (including blocked attempts) are logged with the complete HTTP request/response for review.
 
 ### 🖥️ Professional UI/UX
 - **Dark-Mode / Light-Mode Auto-Detection** — Adapts to Burp's current theme automatically.
-- **Live Dashboard** — 8 metric cards with real-time counters for endpoints, JS files, findings, leaks, processed items, and active tasks.
+- **Compact Summary** — Always-visible result totals, with eight optional metrics revealed by **Show metrics**.
 - **Tab Count Badges** — Each tab title shows a live count of its findings (e.g., `"Leaks (42)"`).
-- **No Wasted Space** — The bottom split-pane has been removed; tables occupy the full viewport.
-- **Interactive Search & Scope Filtering** — Filter all tables in real-time with regex-aware search.
+- **Investigation Workspace** — Compact controls, left-side categories, a resizable selection inspector, and metrics hidden until requested.
+- **Interactive Search & Scope Filtering** — Filter all tables in real-time with literal text search.
 
 ### 🔎 Native Pop-up Viewer (Double-Click)
 - **Full Request/Response** — Opens a resizable, non-modal `JDialog` with Burp's native `IMessageEditor`, showing **Raw**, **Headers**, and **Hex** tabs.
@@ -89,7 +89,7 @@
 
 Check the **Output** tab in the extension details — you should see:
 ```
-Recon Swiss Knife Pro v3 loaded successfully.
+Recon Swiss Knife Pro 3.1.0 loaded successfully.
 ```
 
 ---
@@ -98,11 +98,11 @@ Recon Swiss Knife Pro v3 loaded successfully.
 
 ### Basic Workflow
 
-1. **Set Scope** *(optional)* — Enter comma-separated domain keywords in the **Scope Filter** field (e.g., `example.com, api.target`). Leave empty to process all traffic.
+1. **Set Scope** — Enter comma-separated hostnames in the **Hosts** (e.g., `example.com, api.target`). Matching includes exact hosts and subdomains. An empty filter accepts all passive traffic. **Active fetching, probes and fuzzing additionally require Burp Target scope membership.**
 
-2. **Enable Passive Recon** — Click the **"Passive Recon: OFF"** button to toggle it **ON** (turns green). This will:
-   - Scan existing proxy history.
+2. **Enable Passive Recon** — Click **Start capture** to monitor new traffic, and **Pause capture** to stop. This will:
    - Begin monitoring live traffic in real-time.
+   - Use **Import proxy history** to import existing traffic explicitly (also works while capture is paused).
 
 3. **Browse Your Target** — Navigate the target application normally. The extension passively extracts findings.
 
@@ -128,7 +128,7 @@ Double-click any row in any table to open the **Request/Response Popup**:
 2. Select **"Test Risky Methods (Fuzz Endpoint)"**.
 3. The extension will send `PUT`, `DELETE`, `PATCH`, `DEBUG`, and `TRACE` requests to the endpoint.
 4. Results appear in the **"Method Fuzz Results"** tab.
-5. Rows marked **"VULNERABLE (Bypass Confirmed)"** indicate the server accepted a risky method with a success status code.
+5. A confirmation dialog precedes fuzzing because these methods can modify data. Results marked **"Method accepted - impact unverified"** require baseline comparison and impact verification. Existing request authentication is retained; PUT/PATCH retain the original body.
 
 ### Semi-Active Modules
 
@@ -137,17 +137,96 @@ Double-click any row in any table to open the **Request/Response Popup**:
 
 ### Additional Features
 
-- **Rescan Proxy History** — Re-analyze all existing proxy traffic.
+- **Import proxy history** — Re-analyze all existing proxy traffic.
 - **Clear Data** — Reset all findings and counters.
-- **Search / Filter** — Real-time regex search across all tables.
+- **Find in results** — Literal text search across all result tables.
 - **Right-Click → Copy** — Copy URLs, parameters, or match values to clipboard.
 - **Right-Click → "Send to Recon Swiss Knife"** — Available in Burp's own tools (Proxy, Repeater, etc.) to manually feed items into the extension.
 
 ---
 
+
+## AI review (new in 3.0.0)
+
+The extension remains a **single Python source file for Jython 2.7**. The Java rewrite has been removed. Existing recon tables, native message popups, JS fetching, method fuzzing, and Iranian-specific detection remain available.
+
+1. Right-click any collected row with a request/response and choose **Prepare AI review (redacted preview)**.
+2. The **AI review** workspace opens with an editable context preview and a result panel. Set a full OpenAI-compatible chat-completions URL, a model name, and an optional API key.
+3. Local example: `http://127.0.0.1:11434/v1/chat/completions` with a model installed in your local server. Hosted example: `https://api.openai.com/v1/chat/completions` with a model available to your account and its API key. No particular model is bundled.
+4. Review the exact outbound text, approve sending, then click **Analyze reviewed context**. Editing the endpoint, model, key or context resets approval.
+5. Results remain **unverified hypotheses** with exact evidence quotes and suggested verification steps. No AI-generated request is executed. Use the new **Send original request to Repeater** action for manual verification.
+
+The context excludes request headers and bodies. Query values and common response secrets, emails, Iranian phone numbers and ten-digit identifiers are redacted; only selected response headers and at most 12,000 body characters are included. **Redaction is best effort:** inspect URL paths and arbitrary body values before sharing, or use a local model. Keys remain in process memory and are never saved to project files or Burp settings.
+
+Remote providers require HTTPS; local loopback HTTP is supported. TLS verification remains enabled and redirects are disabled. One review runs at a time, with a 24,000-character context limit, 1,800 requested output tokens, 1 MB response limit, 10-second connection and 45-second read timeouts. Cancel/clear invalidates late results; transport cancellation may take until its timeout. There are no automatic provider retries or automatic per-message AI charges. Traffic is marked as untrusted data in the model prompt; responses must satisfy a schema and quote text from the reviewed context. These controls validate structure and quotes, not security conclusions.
+
+Active tasks use six workers, a queue of 64 jobs, and at least 0.3 seconds between request starts. Scope is checked again before request construction. Queue failures are reported in extension errors, and rejected JS/probe jobs can be retried. Captured request context is retained for same-URL probes/fuzzing. Relative JS links are resolved against their parent page before use.
+
+### Refactored development sources
+
+`ReconSwissKnife_v3.py` is the **generated installation artifact**. Continue loading that one file in Burp; copying the `recon/` package is unnecessary.
+
+Edit `recon/` for development:
+
+- `recon/core/`: pure redaction, provider URL validation, cookie parsing, evidence labels and national-ID validation.
+- `recon/ai/`: pure AI prompt, schema/evidence validation, and context formatting.
+- `recon/burp/extension.py`: the remaining Burp/Swing/network implementation and thin message-extraction adapter.
+
+Rebuild after editing sources; do not edit the generated file directly:
+
+```sh
+python3 tools/bundle.py
+python3 tools/bundle.py --check
+```
+
+The bundler uses an explicit dependency order, removes only supported internal imports, retains standard-library/Java imports, and produces identical bytes for identical inputs. Unsupported dependency ordering, aliases, star imports, and relative internal imports fail the build. No timestamps or machine-specific paths enter the artifact.
+
+### Developer checks
+
+Python 3 runs pure-core and build-tool checks without Burp:
+
+```sh
+python3 -m unittest discover -s tests -p test_core.py
+python3 -m unittest discover -s tests -p test_bundle.py
+```
+
+For full verification, supply Jython standalone 2.7.4 and Burp Extender API 2.3 (test classpath only):
+
+```sh
+python3 tools/verify.py --jython /path/to/jython-standalone-2.7.4.jar --burp-api /path/to/burp-extender-api-2.3.jar
+```
+
+This checks deterministic bundling, 36 pre-refactoring baseline cases, pure modules under both Python 3 and Jython, and the complete extension suite against **both** modular sources and the generated artifact. It also copies only the generated file into an isolated directory, confirms the development package is unavailable, and constructs the Swing UI there. Mock-provider tests require permission to bind a loopback port; no real provider credentials or target application are used.
+
+To render synthetic UI previews:
+
+```sh
+java -Djava.awt.headless=true -cp /path/to/jython.jar:/path/to/burp-api.jar org.python.util.jython -B tests/render_ui.py
+```
+
+Set `RECON_TEST_TARGET=source` to render/test the modular entry point. On Windows use `;` as the Java classpath separator. Live Burp and real-model acceptance remain separate manual checks.
+
+## UI / UX update in 3.1.0
+
+- **Investigate** contains categories on the left, result tables in the center, and a resizable **Selection details** pane.
+- Select a row to enable **Open evidence**, **Prepare AI review**, and **Send to Repeater**. Existing double-click and context-menu actions remain available.
+- **Hosts** filters passive collection by hostname; **Find in results** performs literal text search. **Reset** clears the result search. Visible/total row counts explain filtered results.
+- **Active modules** reveals the optional JS fetch/probe controls; hiding this section does not disable modules already enabled. Both modules start off on load.
+- **Show metrics** reveals the detailed counters. Capture starts paused, and importing history is a separate action.
+- Refreshes preserve unchanged selected rows and coalesce repeated UI update requests. Repeated method/header observations are deduplicated by URL and issue.
+- **AI review** labels the provider, editable context and hypothesis steps. A character counter and send-button validation show when the reviewed context is ready.
+- Literal Unicode escape text in the old header and popup labels is replaced by readable separators.
+
+[Refactoring roadmap](REFACTOR_PLAN.md) describes the next stages; this release keeps the single-file installation.
+
+Synthetic Swing previews (Nimbus look and feel; Burp uses its own theme):
+
+![Investigation workspace](docs/ui-3.1.0-investigate.png)
+![AI review](docs/ui-3.1.0-ai-review.png)
+
 ## 📸 Screenshots
 
-> *Screenshots will be added after initial deployment.*
+> The previews above use synthetic data. The layout follows Burp's active look and feel at runtime.
 
 | View | Description |
 |---|---|

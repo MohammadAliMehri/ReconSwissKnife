@@ -1,0 +1,279 @@
+[
+  {
+    "args": [
+      "hello public world"
+    ],
+    "expected": "hello public world",
+    "function": "redact_ai_text"
+  },
+  {
+    "args": [
+      "Authorization: Bearer abc\nCookie: sid=xyz"
+    ],
+    "expected": "Authorization: [REDACTED]\nCookie: [REDACTED]",
+    "function": "redact_ai_text"
+  },
+  {
+    "args": [
+      "{\"password\":\"fake-password\",\"api_key\":\"fake-key\"}"
+    ],
+    "expected": "{\"password\":\"[REDACTED]\",\"api_key\":\"[REDACTED]\"}",
+    "function": "redact_ai_text"
+  },
+  {
+    "args": [
+      "user@example.test 09123456789 1234567890"
+    ],
+    "expected": "[REDACTED_EMAIL] [REDACTED_PII] [REDACTED_PII]",
+    "function": "redact_ai_text"
+  },
+  {
+    "args": [
+      "sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ],
+    "expected": "[REDACTED_TOKEN]",
+    "function": "redact_ai_text"
+  },
+  {
+    "args": [
+      "AKIAAAAAAAAAAAAAAAAA"
+    ],
+    "expected": "[REDACTED_TOKEN]",
+    "function": "redact_ai_text"
+  },
+  {
+    "args": [
+      "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----"
+    ],
+    "expected": "[REDACTED_PRIVATE_KEY]",
+    "function": "redact_ai_text"
+  },
+  {
+    "args": [
+      "eyJabc.abcdef.signature"
+    ],
+    "expected": "[REDACTED_JWT]",
+    "function": "redact_ai_text"
+  },
+  {
+    "args": [
+      "https://provider.example.test/v1/chat/completions"
+    ],
+    "expected": "https://provider.example.test/v1/chat/completions",
+    "function": "ai_endpoint"
+  },
+  {
+    "args": [
+      " http://127.0.0.1:11434/v1/chat/completions "
+    ],
+    "expected": "http://127.0.0.1:11434/v1/chat/completions",
+    "function": "ai_endpoint"
+  },
+  {
+    "args": [
+      "http://localhost:8080/v1"
+    ],
+    "expected": "http://localhost:8080/v1",
+    "function": "ai_endpoint"
+  },
+  {
+    "args": [
+      "http://remote.test/v1"
+    ],
+    "error": "ValueError",
+    "function": "ai_endpoint"
+  },
+  {
+    "args": [
+      "https://user:key@remote.test/v1"
+    ],
+    "error": "ValueError",
+    "function": "ai_endpoint"
+  },
+  {
+    "args": [
+      "https://remote.test/v1?key=fake"
+    ],
+    "error": "ValueError",
+    "function": "ai_endpoint"
+  },
+  {
+    "args": [
+      "https://remote.test/v1#fragment"
+    ],
+    "error": "ValueError",
+    "function": "ai_endpoint"
+  },
+  {
+    "args": [
+      200
+    ],
+    "expected": "Method accepted - impact unverified",
+    "function": "method_result_label"
+  },
+  {
+    "args": [
+      201
+    ],
+    "expected": "Method accepted - impact unverified",
+    "function": "method_result_label"
+  },
+  {
+    "args": [
+      204
+    ],
+    "expected": "Method accepted - impact unverified",
+    "function": "method_result_label"
+  },
+  {
+    "args": [
+      403
+    ],
+    "expected": "HTTP 403 - no bypass established",
+    "function": "method_result_label"
+  },
+  {
+    "args": [
+      500
+    ],
+    "expected": "HTTP 500 - no bypass established",
+    "function": "method_result_label"
+  },
+  {
+    "args": [
+      "sid=secure_httponly; Path=/"
+    ],
+    "expected": [
+      "path"
+    ],
+    "function": "cookie_attributes"
+  },
+  {
+    "args": [
+      "sid=x; Secure; HttpOnly; SameSite=Lax"
+    ],
+    "expected": [
+      "httponly",
+      "samesite",
+      "secure"
+    ],
+    "function": "cookie_attributes"
+  },
+  {
+    "args": [
+      "sid=x; secure=false; HTTPONLY"
+    ],
+    "expected": [
+      "httponly",
+      "secure"
+    ],
+    "function": "cookie_attributes"
+  },
+  {
+    "args": [
+      "sid=x"
+    ],
+    "expected": [],
+    "function": "cookie_attributes"
+  },
+  {
+    "args": [
+      "1234567891"
+    ],
+    "expected": true,
+    "function": "is_valid_iranian_national_id"
+  },
+  {
+    "args": [
+      "0000000000"
+    ],
+    "expected": false,
+    "function": "is_valid_iranian_national_id"
+  },
+  {
+    "args": [
+      "1111111111"
+    ],
+    "expected": false,
+    "function": "is_valid_iranian_national_id"
+  },
+  {
+    "args": [
+      "123"
+    ],
+    "expected": false,
+    "function": "is_valid_iranian_national_id"
+  },
+  {
+    "args": [
+      "abcdefghij"
+    ],
+    "expected": false,
+    "function": "is_valid_iranian_national_id"
+  },
+  {
+    "args": [
+      "{\"findings\": [{\"evidence\": \"traceback\", \"confidence\": \"low\", \"title\": \"Possible disclosure\", \"explanation\": \"Inspect the error\", \"category\": \"information\", \"verification\": \"Reproduce\"}]}",
+      "a traceback here"
+    ],
+    "expected": [
+      {
+        "category": "information",
+        "confidence": "low",
+        "evidence": "traceback",
+        "explanation": "Inspect the error",
+        "title": "Possible disclosure",
+        "verification": "Reproduce"
+      }
+    ],
+    "function": "validate_ai_findings"
+  },
+  {
+    "args": [
+      "{\"findings\": [{\"evidence\": \"traceback\", \"confidence\": \"low\", \"title\": \"Possible disclosure\", \"explanation\": \"Inspect the error\", \"category\": \"information\", \"verification\": \"Reproduce\"}]}",
+      "no evidence"
+    ],
+    "error": "ValueError",
+    "function": "validate_ai_findings"
+  },
+  {
+    "args": [
+      "{\"findings\":[]}",
+      ""
+    ],
+    "expected": [],
+    "function": "validate_ai_findings"
+  },
+  {
+    "args": [
+      "{}",
+      "traceback"
+    ],
+    "error": "ValueError",
+    "function": "validate_ai_findings"
+  },
+  {
+    "args": [
+      "{\"findings\":[{}]}",
+      "traceback"
+    ],
+    "error": "ValueError",
+    "function": "validate_ai_findings"
+  },
+  {
+    "args": [
+      "not JSON",
+      "traceback"
+    ],
+    "error": "ValueError",
+    "function": "validate_ai_findings"
+  },
+  {
+    "args": [
+      "{\"findings\":[{\"evidence\": \"traceback\", \"confidence\": \"low\", \"title\": \"Possible disclosure\", \"explanation\": \"Inspect the error\", \"category\": \"information\", \"verification\": \"Reproduce\"}, {\"evidence\": \"traceback\", \"confidence\": \"low\", \"title\": \"Possible disclosure\", \"explanation\": \"Inspect the error\", \"category\": \"information\", \"verification\": \"Reproduce\"}, {\"evidence\": \"traceback\", \"confidence\": \"low\", \"title\": \"Possible disclosure\", \"explanation\": \"Inspect the error\", \"category\": \"information\", \"verification\": \"Reproduce\"}, {\"evidence\": \"traceback\", \"confidence\": \"low\", \"title\": \"Possible disclosure\", \"explanation\": \"Inspect the error\", \"category\": \"information\", \"verification\": \"Reproduce\"}, {\"evidence\": \"traceback\", \"confidence\": \"low\", \"title\": \"Possible disclosure\", \"explanation\": \"Inspect the error\", \"category\": \"information\", \"verification\": \"Reproduce\"}, {\"evidence\": \"traceback\", \"confidence\": \"low\", \"title\": \"Possible disclosure\", \"explanation\": \"Inspect the error\", \"category\": \"information\", \"verification\": \"Reproduce\"}, {\"evidence\": \"traceback\", \"confidence\": \"low\", \"title\": \"Possible disclosure\", \"explanation\": \"Inspect the error\", \"category\": \"information\", \"verification\": \"Reproduce\"}, {\"evidence\": \"traceback\", \"confidence\": \"low\", \"title\": \"Possible disclosure\", \"explanation\": \"Inspect the error\", \"category\": \"information\", \"verification\": \"Reproduce\"}, {\"evidence\": \"traceback\", \"confidence\": \"low\", \"title\": \"Possible disclosure\", \"explanation\": \"Inspect the error\", \"category\": \"information\", \"verification\": \"Reproduce\"}, {\"evidence\": \"traceback\", \"confidence\": \"low\", \"title\": \"Possible disclosure\", \"explanation\": \"Inspect the error\", \"category\": \"information\", \"verification\": \"Reproduce\"}, {\"evidence\": \"traceback\", \"confidence\": \"low\", \"title\": \"Possible disclosure\", \"explanation\": \"Inspect the error\", \"category\": \"information\", \"verification\": \"Reproduce\"}]}",
+      "traceback"
+    ],
+    "error": "ValueError",
+    "function": "validate_ai_findings"
+  }
+]
